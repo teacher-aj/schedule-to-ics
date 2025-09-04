@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Schedule → Google Calendar (.ics)</title>
+  <meta name="description" content="Upload a weekly Excel schedule and export your personal events to Google Calendar (.ics) or CSV." />
+  <!-- Tailwind CSS -->
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+  <!-- React + ReactDOM -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <!-- SheetJS -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <!-- Luxon -->
+  <script src="https://cdn.jsdelivr.net/npm/luxon@3.4.4/build/global/luxon.min.js"></script>
+  <!-- Babel for JSX in-browser -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>html,body{background:#f8fafc}</style>
+</head>
+<body class="min-h-screen">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { DateTime } = luxon;
+
+    // ---------- Utilities ----------
+    const DEFAULT_PATTERNS = ["AJ", "A.J.", "A J"]; // Examples: "Sara T", "John D", "AJ"
+    const META_COLUMNS = new Set(["Conflicts"]); // Conflicts are just for schedule planning, not actual events
+
+    function escapeICS(text = "") {
+      return String(text)
+        .replace(/\\/g, "\\\\")
+        .replace(/\\n/g, "\\\\n")
+        .replace(/,/g, "\\\\,")
+        .replace(/;/g, "\\\\;");
+    }
+
+    function keyForEvent(ev){ return [ev.dateISO, ev.start, ev.end, ev.summary].join("::"); }
+
+    function parseHeaderDate(raw){
+      if (typeof raw !== "string") return null;
+      console.log("parseHeaderDate called with:", raw);
+      
+      // Updated to handle format like "*MONDAY, 9.1.25" (with asterisk)
+      const m = raw.match(/^\*?([A-Z]+),?\s*([0-9]+)\.([0-9]+)\.([0-9]+)/i);
+      console.log("Regex match result:", m);
+      
+      if (!m) {
+        console.log("No regex match found");
+        return null;
+      }
+      
+      const dayName = m[1];
+      const month = m[2];
+      const day = m[3];
+      const year = m[4];
+      
+      console.log("Extracted parts:", { dayName, month, day, year });
+      
+      // Handle 2-digit years
+      const fullYear = year.length === 2 ? 2000 + Number(year) : Number(year);
+      console.log("Full year:", fullYear);
+      
+      const dt = DateTime.fromObject({ 
+        year: fullYear, 
+        month: Number(month), 
+        day: Number(day) 
+      }, { zone: "America/New_York" });
+      
+      console.log("DateTime object:", dt);
+      console.log("DateTime valid:", dt.isValid);
+      
+      if (!dt.isValid) return null;
+      return { dayName, dateISO: dt.toFormat("yyyy-LL-dd"), dt };
+    }
+
+    function parseTimeRange(raw){
+      if (typeof raw !== "string") return null;
+      console.log("parseTimeRange called with:", raw);
+      const m = raw.match(/(\d{1,2}:\d{2}\s*[AP]M)\s*-\s*(\d{1,2}:\d{2}\s*[AP]M)/i);
+      if (!m) {
+        console.log("No time match found in:", raw);
+        return null;
+      }
+      console.log("Time match found:", m[1], "to", m[2]);
+      return { start: m[1].replace(/\s+/g," ").toUpperCase(), end: m[2].replace(/\s+/g," ").toUpperCase() };
+    }
+
+    function looksLikeHeaderRow(row){
+      const filled = row.filter(Boolean);
+      if (filled.length < 3) return false;
+      const joined = filled.join(" ");
+      return /(Conflicts|Duties|Meetings|\\b\\d{3}\\b|Lab|SA\\s*\\d{3}|RB\\s*\\d{3}|BB\\s*\\d{3})/i.test(joined);
+    }
+
+    function buildNameRegex(patterns){
+      const extra = [];
+      if (patterns.some(p => p.trim().toLowerCase() === "aj")) extra.push("A\\.?\\s?J\\.?");
+      
+      // Process each pattern to handle names with initials like "Sara T"
+      const parts = patterns.filter(Boolean).map(p => {
+        const trimmed = p.trim();
+        // Escape special regex characters
+        const escaped = trimmed.replace(/[.*+?^${}()|[\\]\\\\]/g,"\\$&");
+        // Handle patterns with single initials (e.g., "Sara T" -> "Sara\\sT")
+        return escaped.replace(/\s([A-Z])\b/g, "\\s$1");
+      });
+      
+      const all = [...parts, ...extra];
+      if (!all.length) return /$a/;
+      return new RegExp(`(?:${all.join("|")})`,"i");
+    }
+
+    function toICSDateUTC(dt){ return dt.toUTC().toFormat("yyyyLLdd'T'HHmmss'Z'"); }
+
+    function dedupeEvents(list){
+      const seen = new Set(); const out = [];
+      for(const ev of list){ const k = keyForEvent(ev); if(!seen.has(k)){ seen.add(k); out.push(ev);}}
+      return out;
+    }
+
+    // ---------- App ----------
+    function App(){
+      const [file, setFile] = React.useState(null);
+      const [workbook, setWorkbook] = React.useState(null);
+      const [sheetName, setSheetName] = React.useState("");
+      const [patterns, setPatterns] = React.useState(() => {
+        const saved = localStorage.getItem("aj_patterns");
+        return saved ? JSON.parse(saved) : DEFAULT_PATTERNS;
+      });
+      const [includeMeta, setIncludeMeta] = React.useState(() => {
+        const saved = localStorage.getItem("aj_include_meta");
+        return saved ? JSON.parse(saved) : true; // include Conflicts/Duties/Meetings if name appears
+      });
+      const [useUTC, setUseUTC] = React.useState(() => {
+        const saved = localStorage.getItem("aj_use_utc");
+        return saved ? JSON.parse(saved) : true; // best compatibility for Google Calendar
+      });
+      const [tzid, setTzid] = React.useState(() => {
+        const saved = localStorage.getItem("aj_tzid");
+        return saved || "America/New_York";
+      });
+      const [events, setEvents] = React.useState([]);
+      const [status, setStatus] = React.useState("");
+
+      const nameRegex = React.useMemo(() => buildNameRegex(patterns), [patterns]);
+
+      async function handleFile(f){
+        if(!f) return;
+        setStatus("Reading file…");
+        const data = await f.arrayBuffer();
+        const wb = XLSX.read(data, { type: "array" });
+        setWorkbook(wb);
+        const pref = wb.SheetNames.find(n => /schedule/i.test(n)) || wb.SheetNames[0];
+        setSheetName(pref);
+        setFile(f);
+        setStatus("File loaded. Choose settings if needed, then Parse.");
+      }
+
+      function parse(){
+        if(!workbook || !sheetName) return;
+        setStatus("Parsing…");
+        const ws = workbook.Sheets[sheetName];
+        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
+        if(!rows || !rows.length){ setStatus("No data found in the selected sheet."); setEvents([]); return; }
+
+        // Find a likely header row (column labels). Schedules are loose, so this is heuristic.
+        let headerRowIdx = -1;
+        for(let i=0;i<Math.min(rows.length,15);i++){
+          const row = rows[i].map(v => typeof v==="string" ? v.trim(): v);
+          if(looksLikeHeaderRow(row)){ headerRowIdx = i; break; }
+        }
+        if(headerRowIdx < 0) headerRowIdx = 0;
+
+        const headerRow = rows[headerRowIdx] || [];
+        const colNames = headerRow.map((c,i)=>(c && String(c).trim()) || `Col ${i+1}`);
+
+        const allowedCols = new Set();
+        for(let j=1;j<colNames.length;j++){
+          const name = String(colNames[j]||"").trim();
+          // Simple logic: include column if it's not in META_COLUMNS (unless includeMeta is true)
+          if (includeMeta || !META_COLUMNS.has(name)) {
+            allowedCols.add(j);
+          } else {
+            console.log("Excluding meta column:", name, "at index", j);
+          }
+        }
+        console.log("META_COLUMNS:", Array.from(META_COLUMNS));
+        console.log("Allowed columns:", Array.from(allowedCols));
+        console.log("Column names:", colNames);
+        
+        // Additional check: ensure conflicts columns are excluded
+        for(let j=1;j<colNames.length;j++){
+          const name = String(colNames[j]||"").trim();
+          if(name.toLowerCase().includes("conflict")) {
+            console.log("Found conflicts column:", name, "at index", j);
+            if(allowedCols.has(j)) {
+              console.log("WARNING: Conflicts column is still in allowed columns!");
+              allowedCols.delete(j);
+              console.log("Removed conflicts column from allowed columns");
+            }
+          }
+        }
+
+        let currentDay = null;
+        const out = [];
+
+        for(let r=0;r<rows.length;r++){
+          const row = rows[r];
+          const c0 = row?.[0];
+          console.log(`Processing row ${r}:`, c0);
+          
+          // Stop parsing when we hit summary/statistical rows
+          if (typeof c0 === "string" && /^(COUNTER|HUM|ELA|SOC|SCI|TSBP|MATH|IVRIT\/TANACH|MUSIC|Specials|Extra)$/i.test(c0.trim())) {
+            console.log("Stopping at summary row:", c0.trim());
+            break;
+          }
+          
+          // Updated to handle dates with or without asterisk
+          if (typeof c0 === "string" && /^\*?[A-Z]+,\s*[0-9]+\.[0-9]+\.[0-9]+/i.test(c0.trim())){
+            console.log("Found date header:", c0.trim());
+            const parsed = parseHeaderDate(c0.trim());
+            console.log("parseHeaderDate returned:", parsed);
+            if(parsed) {
+              currentDay = parsed;
+              console.log("Parsed date:", parsed);
+            } else {
+              console.log("parseHeaderDate failed for:", c0.trim());
+            }
+            continue;
+          }
+          if(!currentDay) {
+            console.log("No current day set, skipping row");
+            continue;
+          }
+
+          const time = parseTimeRange(String(c0 || ""));
+          if(!time) {
+            console.log("No time found in:", c0);
+            continue;
+          }
+          console.log("Found time:", time, "for row:", c0);
+
+          for(let j=1;j<row.length;j++){
+            if(!allowedCols.has(j)) continue;
+            const cell = row[j];
+            if(!cell || typeof cell !== "string") continue;
+            
+            // Double-check: skip any cells from conflicts columns
+            const colName = colNames[j] || "";
+            if(colName.toLowerCase().includes("conflict")) {
+              console.log("Skipping conflicts column cell:", cell);
+              continue;
+            }
+            
+            // Skip cells that contain "<--see schedule" (these are conflict/reference cells)
+            if(cell.includes("<--see schedule")) {
+              console.log("Skipping conflict/reference cell:", cell);
+              continue;
+            }
+            
+            console.log("Checking cell:", cell, "against patterns:", patterns);
+            if(!nameRegex.test(cell)) continue;
+            console.log("Found name match in cell:", cell);
+            
+            // Additional debugging to see what matched
+            const matchResult = cell.match(nameRegex);
+            console.log("Regex match result:", matchResult);
+
+            const roomMatch = cell.match(/\(([^)]+)\)\s*$/);
+            const room = roomMatch ? roomMatch[1] : (/(Lab)/i.test(cell) ? "Lab" : "");
+            const location = room || (colNames[j] || "");
+
+            const startDT = DateTime.fromFormat(`${currentDay.dateISO} ${time.start}`, "yyyy-LL-dd h:mm a", { zone: tzid });
+            const endDT   = DateTime.fromFormat(`${currentDay.dateISO} ${time.end}`,   "yyyy-LL-dd h:mm a", { zone: tzid });
+            if(!startDT.isValid || !endDT.isValid) continue;
+
+            // Simplify lunch and duty descriptions
+            let summary = cell.trim();
+            let description = `${String(c0||"").split(" - ")[0] || ""} | ${cell.trim()}`;
+            
+            // Enhanced lunch duty parsing - find your specific duty assignment
+            if (summary.includes("Lunch") && nameRegex.test(summary)) {
+              console.log("Processing lunch duty cell:", summary);
+              
+              // Split by common separators to find individual duty assignments
+              const dutyAssignments = summary.split(/[|;\n]/).map(d => d.trim()).filter(d => d);
+              console.log("Individual duty assignments:", dutyAssignments);
+              
+              // Find the duty assignment that contains your name
+              let yourDuty = null;
+              for (const duty of dutyAssignments) {
+                if (nameRegex.test(duty)) {
+                  // Extract the duty description (everything before the dash)
+                  const dutyMatch = duty.match(/^([^-]+)\s*-\s*(.+)$/);
+                  if (dutyMatch) {
+                    yourDuty = dutyMatch[1].trim(); // The duty description
+                    console.log("Found your duty:", yourDuty);
+                    break;
+                  }
+                }
+              }
+              
+              if (yourDuty) {
+                summary = yourDuty;
+                description = `${String(c0||"").split(" - ")[0] || ""} | ${yourDuty}`;
+                console.log("Updated summary to:", summary);
+              } else {
+                // Fallback: use "Lunch Duty" if we can't extract specific duty
+                summary = "Lunch Duty";
+                description = `${String(c0||"").split(" - ")[0] || ""} | Lunch Duty`;
+                console.log("Using fallback: Lunch Duty");
+              }
+            }
+            
+            // Skip cells that are just duty assignments for other people
+            // Look for patterns like "Name Duty" where Name is not your name
+            const dutyPattern = /^([A-Za-z]+)\s+(DH|Hallway|Roof|Bus|Arrival|Dismissal)/i;
+            const dutyMatch = summary.match(dutyPattern);
+            if (dutyMatch) {
+              const assignedPerson = dutyMatch[1];
+              // Check if this duty is assigned to someone else
+              if (!nameRegex.test(assignedPerson)) {
+                console.log("Skipping duty assignment for someone else:", summary);
+                continue; // Skip this cell
+              }
+            }
+            
+            out.push({
+              dayName: currentDay.dayName,
+              dateISO: currentDay.dateISO,
+              start: time.start, end: time.end,
+              summary: summary,
+              description: description,
+              location,
+              startDT, endDT
+            });
+          }
+        }
+
+        const deduped = dedupeEvents(out);
+        setEvents(deduped);
+        setStatus(`Parsed ${deduped.length} personal events.`);
+      }
+
+      function downloadICS(){
+        if(!events.length) return;
+        const lines = [
+          "BEGIN:VCALENDAR",
+          "VERSION:2.0",
+          "CALSCALE:GREGORIAN",
+          "METHOD:PUBLISH",
+          "PRODID:-//AJ Schedule Export//EN",
+        ];
+
+        // If not exporting UTC, include a minimal VTIMEZONE block for NY
+        if(!useUTC && tzid){
+          lines.push(
+            "BEGIN:VTIMEZONE",
+            `TZID:${tzid}`,
+            "BEGIN:STANDARD",
+            "DTSTART:19701101T020000",
+            "TZOFFSETFROM:-0400",
+            "TZOFFSETTO:-0500",
+            "RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+            "END:STANDARD",
+            "BEGIN:DAYLIGHT",
+            "DTSTART:19700308T020000",
+            "TZOFFSETFROM:-0500",
+            "TZOFFSETTO:-0400",
+            "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+            "END:DAYLIGHT",
+            "END:VTIMEZONE"
+          );
+        }
+
+        const dtstamp = DateTime.utc().toFormat("yyyyLLdd'T'HHmmss'Z'");
+        for(const ev of events){
+          const uid = `${ev.startDT.toFormat("yyyyLLdd'T'HHmmss")}-${Math.abs(Array.from(ev.summary).reduce((a,c)=>a+c.charCodeAt(0),0))}@aj-schedule`;
+          const DTSTART = useUTC ? ev.startDT.toUTC() : ev.startDT;
+          const DTEND   = useUTC ? ev.endDT.toUTC()   : ev.endDT;
+
+          lines.push(
+            "BEGIN:VEVENT",
+            `UID:${uid}`,
+            `DTSTAMP:${dtstamp}`,
+            useUTC
+              ? `DTSTART:${DTSTART.toFormat("yyyyLLdd'T'HHmmss'Z'")}`
+              : `DTSTART;TZID=${tzid}:${DTSTART.toFormat("yyyyLLdd'T'HHmmss")}`,
+            useUTC
+              ? `DTEND:${DTEND.toFormat("yyyyLLdd'T'HHmmss'Z'")}`
+              : `DTEND;TZID=${tzid}:${DTEND.toFormat("yyyyLLdd'T'HHmmss")}`,
+            `SUMMARY:${escapeICS(ev.summary)}`,
+            `DESCRIPTION:${escapeICS(ev.description)}`,
+            `LOCATION:${escapeICS(ev.location || "")}`,
+            "END:VEVENT"
+          );
+        }
+
+        lines.push("END:VCALENDAR");
+
+        const blob = new Blob([lines.join("\r\n")], { type: "text/calendar" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `AJ_schedule_${useUTC ? "utc" : tzid.replaceAll("/", "-")}.ics`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      }
+
+      function downloadCSV(){
+        if(!events.length) return;
+        const headers = ["Subject","Start Date","Start Time","End Date","End Time","Description","Location"];
+        const rows = events.map(ev => [
+          ev.summary,
+          DateTime.fromISO(ev.dateISO).toFormat("MM/dd/yyyy"),
+          ev.start,
+          DateTime.fromISO(ev.dateISO).toFormat("MM/dd/yyyy"),
+          ev.end,
+          ev.description,
+          ev.location || ""
+        ]);
+        const csv = [headers, ...rows].map(r => r.map(x => `"${String(x).replaceAll('"','""')}"`).join(",")).join("\r\n");
+        const blob = new Blob([csv], { type: "text/csv" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "AJ_schedule.csv";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      }
+
+      function persist(){
+        localStorage.setItem("aj_patterns", JSON.stringify(patterns));
+        localStorage.setItem("aj_include_meta", JSON.stringify(includeMeta));
+        localStorage.setItem("aj_use_utc", JSON.stringify(useUTC));
+        localStorage.setItem("aj_tzid", tzid);
+        setStatus("Settings saved.");
+      }
+
+      function resetAll(){
+        setFile(null); setWorkbook(null); setSheetName(""); setEvents([]); setStatus("");
+      }
+
+      return (
+        <div className="mx-auto max-w-5xl p-6">
+          <header className="mb-6 flex items-center justify-between">
+            <h1 className="text-2xl font-semibold">Schedule → Google Calendar (.ics)</h1>
+            <div className="text-sm text-gray-500">{events.length ? `${events.length} events` : "No events yet"}</div>
+          </header>
+
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div className="lg:col-span-2 space-y-4">
+              <div className="rounded-2xl border bg-white p-5 shadow-sm">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h2 className="text-lg font-medium">Upload weekly Excel schedule</h2>
+                    <p className="text-sm text-gray-500">.xlsx / .xls — the app will find every place your name appears.</p>
+                  </div>
+                  <button onClick={resetAll} className="rounded-xl border px-3 py-2 text-sm hover:bg-gray-50">Reset</button>
+                </div>
+
+                <div className="mt-4 flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-6">
+                  <input id="file" type="file" accept=".xlsx,.xls" onChange={e => handleFile(e.target.files?.[0])} className="hidden" />
+                  <label htmlFor="file" className="cursor-pointer inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2 text-white hover:bg-indigo-500">
+                    Choose file
+                  </label>
+                  {file && <p className="mt-2 text-sm text-gray-600">{file.name}</p>}
+                  {status && <p className="mt-2 text-sm text-gray-500">{status}</p>}
+                </div>
+
+                {workbook && (
+                  <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium text-gray-700">Sheet</label>
+                      <select value={sheetName} onChange={e => setSheetName(e.target.value)} className="w-full rounded-xl border bg-white p-2 text-sm">
+                        {workbook.SheetNames.map(n => <option key={n} value={n}>{n}</option>)}
+                      </select>
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium text-gray-700">Detected name patterns</label>
+                      <input type="text" value={patterns.join(", ")} onChange={e => {
+                        const input = e.target.value;
+                        // Split by comma and handle each pattern, allowing spaces within names
+                        const newPatterns = input.split(",").map(s => s.trim()).filter(Boolean);
+                        console.log("New patterns:", newPatterns);
+                        setPatterns(newPatterns);
+                      }} className="w-full rounded-xl border bg-white p-2 text-sm" placeholder="Sara T, John D, AJ, A.J., A J" />
+                      <p className="text-xs text-gray-500">You can use initials like "Sara T" or full names like "John Doe". Separate multiple patterns with commas.</p>
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium text-gray-700">Timezone</label>
+                      <input type="text" value={tzid} onChange={e => setTzid(e.target.value)} className="w-full rounded-xl border bg-white p-2 text-sm" placeholder="America/New_York" />
+                      <p className="text-xs text-gray-500">IANA timezone (default America/New_York).</p>
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium text-gray-700">Options</label>
+                      <div className="flex flex-col gap-2 text-sm">
+                        <label className="flex items-center gap-2"><input type="checkbox" className="h-4 w-4" checked={includeMeta} onChange={e => setIncludeMeta(e.target.checked)} /> Include Conflicts / Duties / Meetings</label>
+                        <label className="flex items-center gap-2"><input type="checkbox" className="h-4 w-4" checked={useUTC} onChange={e => setUseUTC(e.target.checked)} /> Export as UTC (most compatible)</label>
+                      </div>
+                    </div>
+
+                    <div className="sm:col-span-2 flex items-center gap-3">
+                      <button onClick={parse} className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2 text-white hover:bg-indigo-500">Parse schedule</button>
+                      <button onClick={persist} className="inline-flex items-center gap-2 rounded-xl border px-4 py-2 hover:bg-gray-50">Remember settings</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="rounded-2xl border bg-white p-5 shadow-sm">
+                <div className="mb-3 flex items-center justify-between">
+                  <h2 className="text-lg font-medium">Preview (your events only)</h2>
+                  <div className="flex items-center gap-2">
+                    <button onClick={downloadICS} className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-3 py-2 text-white text-sm hover:bg-emerald-500 disabled:opacity-50" disabled={!events.length}>Download .ics</button>
+                    <button onClick={downloadCSV} className="inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-sm hover:bg-gray-50 disabled:opacity-50" disabled={!events.length}>Download .csv</button>
+                  </div>
+                </div>
+
+                {events.length === 0 ? (
+                  <p className="text-sm text-gray-500">No events yet. Upload and parse your schedule to see your matches.</p>
+                ) : (
+                  <div className="space-y-4">
+                    {Object.entries(events.reduce((acc, ev) => { (acc[`${ev.dayName} • ${ev.dateISO}`] ||= []).push(ev); return acc; }, {})).map(([day, list]) => (
+                      <div key={day} className="rounded-xl border p-3">
+                        <div className="mb-2 text-sm font-semibold text-gray-700">{day}</div>
+                        <ul className="space-y-2">
+                          {list.sort((a,b)=>a.startDT.toMillis() - b.startDT.toMillis()).map((ev,i)=>(
+                            <li key={i} className="grid grid-cols-1 md:grid-cols-6 items-start gap-2 text-sm">
+                              <div className="md:col-span-2 font-medium">{ev.start} – {ev.end}</div>
+                              <div className="md:col-span-3">{ev.summary}</div>
+                              <div className="md:col-span-1 text-gray-500">{ev.location}</div>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Tips section - commented out but kept for future modification
+            <aside className="space-y-4 rounded-2xl border bg-white p-5 shadow-sm">
+              <div className="rounded-xl bg-indigo-50 p-3 text-sm text-indigo-900">
+                <p className="font-medium mb-1">Tips</p>
+                <ul className="list-disc pl-5 space-y-1">
+                  <li>Add your first name to <em>Detected name patterns</em> to catch boxes where only the first name appears.</li>
+                  <li>Keep your Excel layout consistent week to week.</li>
+                  <li>Use the <strong>UTC</strong> option for the most reliable Google Calendar import.</li>
+                  <li>Conflicts are automatically excluded as they're just for schedule planning.</li>
+                  <li>Lunch duties are simplified to show just the duty, not all names.</li>
+                </ul>
+              </div>
+            </aside>
+            */}
+          </div>
+        </div>
+      );
+    }
+
+    // Render
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+
+    // Polyfill for stable-ish UID generation
+    if (!String.prototype.hashCode){
+      Object.defineProperty(String.prototype, "hashCode", {
+        value: function(){ let h=0, i, chr; if (this.length===0) return h; for(i=0;i<this.length;i++){ chr=this.charCodeAt(i); h=(h<<5)-h+chr; h|=0;} return h; },
+        enumerable: false
+      });
+    }
+  </script>
+</body>
+</html>
